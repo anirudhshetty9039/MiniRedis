@@ -2,7 +2,8 @@ package com.miniredis.storage;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /** Concurrent map with lazy expiry; cleanupExpired is invoked periodically by the server. */
 public final class InMemoryKeyValueStore implements KeyValueStore {
@@ -12,40 +13,55 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
         }
     }
 
-    private final ConcurrentHashMap<String, Entry> values = new ConcurrentHashMap<>();
+    private final Map<String, Entry> values = new LinkedHashMap<>(16, 0.75f, true);
+    private final int maxKeys;
+    private final Runnable evictionListener;
+    private long evictions;
 
-    public void set(String key, String value, Long expirationMillis) {
-        values.put(key, new Entry(value, expirationMillis));
+    public InMemoryKeyValueStore() {
+        this(0);
     }
 
-    public Optional<String> get(String key) {
+    public InMemoryKeyValueStore(int maxKeys) {
+        this(maxKeys, () -> { });
+    }
+
+    public InMemoryKeyValueStore(int maxKeys, Runnable evictionListener) {
+        if (maxKeys < 0)
+            throw new IllegalArgumentException("maxKeys must not be negative");
+        this.maxKeys = maxKeys;
+        this.evictionListener = evictionListener;
+    }
+
+    public synchronized void set(String key, String value, Long expirationMillis) {
+        values.put(key, new Entry(value, expirationMillis));
+        evictIfNeeded();
+    }
+
+    public synchronized Optional<String> get(String key) {
         Entry entry = live(key);
         return entry == null ? Optional.empty() : Optional.of(entry.value());
     }
 
-    public boolean delete(String key) {
+    public synchronized boolean delete(String key) {
         return values.remove(key) != null;
     }
 
-    public boolean exists(String key) {
+    public synchronized boolean exists(String key) {
         return live(key) != null;
     }
 
-    public boolean expire(String key, long seconds) {
+    public synchronized boolean expire(String key, long seconds) {
         long at = seconds <= 0 ? System.currentTimeMillis()
                 : System.currentTimeMillis() + Math.multiplyExact(seconds, 1000);
-        final boolean[] changed = {false};
-        values.computeIfPresent(key, (k, old) -> {
-            if (old.expired(System.currentTimeMillis())) {
-                return null;
-            }
-            changed[0] = true;
-            return new Entry(old.value(), at);
-        });
-        return changed[0];
+        Entry old = live(key);
+        if (old == null)
+            return false;
+        values.put(key, new Entry(old.value(), at));
+        return true;
     }
 
-    public long ttl(String key) {
+    public synchronized long ttl(String key) {
         Entry entry = live(key);
         if (entry == null) {
             return -2;
@@ -57,22 +73,35 @@ public final class InMemoryKeyValueStore implements KeyValueStore {
         return left <= 0 ? -2 : Math.max(1, (left + 999) / 1000);
     }
 
-    public Set<String> keys() {
+    public synchronized Set<String> keys() {
         cleanupExpired();
         return new TreeSet<>(values.keySet());
     }
 
-    public void cleanupExpired() {
+    public synchronized void cleanupExpired() {
         long now = System.currentTimeMillis();
         values.entrySet().removeIf(e -> e.getValue().expired(now));
+    }
+
+    public synchronized long evictionCount() {
+        return evictions;
     }
 
     private Entry live(String key) {
         Entry entry = values.get(key);
         if (entry != null && entry.expired(System.currentTimeMillis())) {
-            values.remove(key, entry);
+            values.remove(key);
             return null;
         }
         return entry;
+    }
+
+    private void evictIfNeeded() {
+        while (maxKeys > 0 && values.size() > maxKeys) {
+            String eldest = values.keySet().iterator().next();
+            values.remove(eldest);
+            evictions++;
+            evictionListener.run();
+        }
     }
 }
