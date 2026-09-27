@@ -3,7 +3,8 @@ package com.miniredis.protocol;
 import java.util.List;
 
 /** Values in the small RESP2 subset used by MiniRedis. */
-public sealed interface RespValue permits RespValue.Simple, RespValue.Error, RespValue.Number, RespValue.Bulk, RespValue.Array {
+public sealed interface RespValue permits RespValue.Simple, RespValue.Error, RespValue.Number, RespValue.Bulk, RespValue.Array 
+{
     record Simple(String value) implements RespValue {
     }
 
