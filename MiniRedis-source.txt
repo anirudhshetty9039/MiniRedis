@@ -1,0 +1,1314 @@
+﻿MiniRedis - Complete Source Listing
+
+Generated from the current project files.
+
+Included structure:
+- .\pom.xml
+- .\src\main\java\com\miniredis\benchmark\MiniRedisBenchmark.java
+- .\src\main\java\com\miniredis\client\MiniRedisCli.java
+- .\src\main\java\com\miniredis\command\CommandDispatcher.java
+- .\src\main\java\com\miniredis\config\ServerConfig.java
+- .\src\main\java\com\miniredis\metrics\Metrics.java
+- .\src\main\java\com\miniredis\persistence\AofPersistence.java
+- .\src\main\java\com\miniredis\protocol\RespEncoder.java
+- .\src\main\java\com\miniredis\protocol\RespException.java
+- .\src\main\java\com\miniredis\protocol\RespParser.java
+- .\src\main\java\com\miniredis\protocol\RespValue.java
+- .\src\main\java\com\miniredis\server\MiniRedisServer.java
+- .\src\main\java\com\miniredis\storage\InMemoryKeyValueStore.java
+- .\src\main\java\com\miniredis\storage\KeyValueStore.java
+- .\src\test\java\com\miniredis\command\CommandDispatcherTest.java
+- .\src\test\java\com\miniredis\config\ServerConfigTest.java
+- .\src\test\java\com\miniredis\persistence\AofPersistenceTest.java
+- .\src\test\java\com\miniredis\protocol\RespProtocolTest.java
+- .\src\test\java\com\miniredis\server\MiniRedisServerIntegrationTest.java
+- .\src\test\java\com\miniredis\storage\InMemoryKeyValueStoreTest.java
+
+================================================================================
+FILE: .\pom.xml
+================================================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.miniredis</groupId>
+    <artifactId>miniredis</artifactId>
+    <version>1.0.0</version>
+    <name>MiniRedis</name>
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <junit.version>5.11.4</junit.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <archive><manifest><mainClass>com.miniredis.server.MiniRedisServer</mainClass></manifest></archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\benchmark\MiniRedisBenchmark.java
+================================================================================
+package com.miniredis.benchmark;
+
+import com.miniredis.protocol.*;
+import java.io.*;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Simple socket benchmark; start MiniRedis separately before running it. */
+public final class MiniRedisBenchmark {
+    private MiniRedisBenchmark() { }
+
+    public static void main(String[] args) throws Exception {
+        String host = args.length > 0 ? args[0] : "localhost";
+        int port = args.length > 1 ? Integer.parseInt(args[1]) : 6379;
+        int clients = args.length > 2 ? Integer.parseInt(args[2]) : 4;
+        int operations = args.length > 3 ? Integer.parseInt(args[3]) : 10_000;
+        String workload = args.length > 4 ? args[4].toUpperCase() : "MIXED";
+        if (clients < 1 || operations < 1 || !List.of("SET", "GET", "MIXED").contains(workload))
+            throw new IllegalArgumentException("usage: host port clients operations SET|GET|MIXED");
+
+        ExecutorService pool = Executors.newFixedThreadPool(clients);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(clients);
+        AtomicLong completed = new AtomicLong();
+        long started = System.nanoTime();
+        for (int client = 0; client < clients; client++) {
+            int id = client;
+            pool.execute(() -> {
+                try (Socket socket = new Socket(host, port)) {
+                    start.await();
+                    for (int i = 0; i < operations; i++) {
+                        boolean set = workload.equals("SET") || (workload.equals("MIXED") && (i & 1) == 0);
+                        send(socket, set ? "SET" : "GET", "bench-" + id + '-' + (i % 100), "value");
+                        completed.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        start.countDown();
+        done.await();
+        pool.shutdown();
+        double seconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        System.out.printf("operations=%d duration_seconds=%.3f operations_per_second=%.1f clients=%d workload=%s%n",
+                completed.get(), seconds, completed.get() / seconds, clients, workload);
+    }
+
+    private static void send(Socket socket, String command, String key, String value) throws IOException {
+        List<RespValue> args = command.equals("GET")
+                ? List.of(bulk(command), bulk(key))
+                : List.of(bulk(command), bulk(key), bulk(value));
+        RespEncoder.write(new RespValue.Array(args), socket.getOutputStream());
+        socket.getOutputStream().flush();
+        if (RespParser.read(socket.getInputStream()) == null)
+            throw new EOFException("server closed connection");
+    }
+
+    private static RespValue.Bulk bulk(String value) {
+        return new RespValue.Bulk(value.getBytes(StandardCharsets.UTF_8));
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\client\MiniRedisCli.java
+================================================================================
+package com.miniredis.client;
+
+import com.miniredis.protocol.*;
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+/**
+ * Minimal interactive demo client; quote handling is intentionally not
+ * implemented.
+ */
+public final class MiniRedisCli {
+    public static void main(String[] args) throws Exception {
+        String host = args.length > 0 ? args[0] : "localhost";
+        int port = args.length > 1 ? Integer.parseInt(args[1]) : 6379;
+        try (Socket socket = new Socket(host, port);
+                BufferedReader console = new BufferedReader(new InputStreamReader(System.in));
+                InputStream in = socket.getInputStream();
+                OutputStream out = socket.getOutputStream()) {
+            System.out.println("Connected. Enter Redis commands; Ctrl+Z then Enter exits.");
+            String line;
+            while ((line = console.readLine()) != null) {
+                List<RespValue> values = Arrays.stream(line.trim().split("\\s+")).filter(s -> !s.isEmpty())
+                        .map(s -> new RespValue.Bulk(s.getBytes(StandardCharsets.UTF_8))).map(v -> (RespValue) v)
+                        .toList();
+                if (values.isEmpty())
+                    continue;
+                RespEncoder.write(new RespValue.Array(values), out);
+                out.flush();
+                System.out.println(render(RespParser.read(in)));
+            }
+        }
+    }
+
+    private static String render(RespValue v) {
+        if (v instanceof RespValue.Bulk b)
+            return b.isNull() ? "(nil)" : new String(b.value(), StandardCharsets.UTF_8);
+        if (v instanceof RespValue.Simple s)
+            return s.value();
+        if (v instanceof RespValue.Error e)
+            return "(error) " + e.message();
+        if (v instanceof RespValue.Number n)
+            return Long.toString(n.value());
+        if (v instanceof RespValue.Array a)
+            return a.values().toString();
+        return "(nil)";
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\command\CommandDispatcher.java
+================================================================================
+package com.miniredis.command;
+
+import com.miniredis.persistence.AofPersistence;
+import com.miniredis.protocol.*;
+import com.miniredis.storage.KeyValueStore;
+import com.miniredis.metrics.Metrics;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+/**
+ * Converts protocol arrays to commands; storage remains independent of both
+ * sockets and RESP.
+ */
+public final class CommandDispatcher {
+    private final KeyValueStore store;
+    private final AofPersistence aof;
+    private final Metrics metrics;
+
+    public CommandDispatcher(KeyValueStore store, AofPersistence aof) {
+        this(store, aof, new Metrics());
+    }
+
+    public CommandDispatcher(KeyValueStore store, AofPersistence aof, Metrics metrics) {
+        this.store = store;
+        this.aof = aof;
+        this.metrics = metrics;
+    }
+
+    public RespValue execute(RespValue request) {
+        try {
+            return execute(toStrings(request), true);
+        } catch (CommandError e) {
+            return new RespValue.Error("ERR " + e.getMessage());
+        } catch (IOException e) {
+            return new RespValue.Error("ERR persistence failure: " + e.getMessage());
+        }
+    }
+
+    public void replay(List<String> command) {
+        try {
+            execute(command, false);
+        } catch (Exception ignored) {
+            /* a malformed historical command is skipped */ }
+    }
+
+    private RespValue execute(List<String> args, boolean persist) throws IOException, CommandError {
+        if (args.isEmpty())
+            throw new CommandError("empty command");
+        String op = args.get(0).toUpperCase(Locale.ROOT);
+        if (persist)
+            metrics.command();
+        RespValue result;
+        boolean mutation = false;
+        switch (op) {
+            case "PING" -> {
+                require(args, 1, 2);
+                result = args.size() == 1 ? new RespValue.Simple("PONG") : bulk(args.get(1));
+            }
+            case "GET" -> {
+                require(args, 2);
+                Optional<String> value = store.get(args.get(1));
+                metrics.get(value.isPresent());
+                result = value.<RespValue>map(CommandDispatcher::bulk).orElse(new RespValue.Bulk(null));
+            }
+            case "SET" -> {
+                if (args.size() != 3 && args.size() != 5)
+                    throw new CommandError("wrong number of arguments for 'set'");
+                Long expiry = null;
+                if (args.size() == 5) {
+                    if (!args.get(3).equalsIgnoreCase("EX"))
+                        throw new CommandError("unsupported SET option");
+                    long seconds = positive(args.get(4));
+                    expiry = System.currentTimeMillis() + Math.multiplyExact(seconds, 1000);
+                }
+                store.set(args.get(1), args.get(2), expiry);
+                if (persist)
+                    metrics.set();
+                result = new RespValue.Simple("OK");
+                mutation = true;
+            }
+            case "DEL" -> {
+                if (args.size() < 2)
+                    throw new CommandError("wrong number of arguments for 'del'");
+                long n = 0;
+                for (int i = 1; i < args.size(); i++)
+                    if (store.delete(args.get(i)))
+                        n++;
+                result = new RespValue.Number(n);
+                mutation = n > 0;
+            }
+            case "EXISTS" -> {
+                if (args.size() < 2)
+                    throw new CommandError("wrong number of arguments for 'exists'");
+                long n = 0;
+                for (int i = 1; i < args.size(); i++)
+                    if (store.exists(args.get(i)))
+                        n++;
+                result = new RespValue.Number(n);
+            }
+            case "EXPIRE" -> {
+                require(args, 3);
+                boolean changed = store.expire(args.get(1), integer(args.get(2)));
+                result = new RespValue.Number(changed ? 1 : 0);
+                mutation = changed;
+            }
+            case "TTL" -> {
+                require(args, 2);
+                result = new RespValue.Number(store.ttl(args.get(1)));
+            }
+            case "KEYS" -> {
+                require(args, 2);
+                if (!args.get(1).equals("*"))
+                    throw new CommandError("only KEYS * is supported");
+                result = new RespValue.Array(
+                        store.keys().stream().map(CommandDispatcher::bulk).map(x -> (RespValue) x).toList());
+            }
+            case "INFO" -> {
+                require(args, 1);
+                result = bulk(metrics.info(store.keys().size()));
+            }
+            default -> throw new CommandError("unknown command '" + args.get(0) + "'");
+        }
+        if (persist && mutation && aof != null)
+            aof.append(args);
+        return result;
+    }
+
+    private static List<String> toStrings(RespValue request) throws CommandError {
+        if (!(request instanceof RespValue.Array a) || a.isNull())
+            throw new CommandError("expected command array");
+        List<String> out = new ArrayList<>();
+        for (RespValue v : a.values()) {
+            if (!(v instanceof RespValue.Bulk b) || b.isNull())
+                throw new CommandError("command arguments must be bulk strings");
+            out.add(new String(b.value(), StandardCharsets.UTF_8));
+        }
+        return out;
+    }
+
+    private static RespValue.Bulk bulk(String value) {
+        return new RespValue.Bulk(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void require(List<String> a, int n) throws CommandError {
+        if (a.size() != n)
+            throw new CommandError("wrong number of arguments");
+    }
+
+    private static void require(List<String> a, int min, int max) throws CommandError {
+        if (a.size() < min || a.size() > max)
+            throw new CommandError("wrong number of arguments");
+    }
+
+    private static long integer(String v) throws CommandError {
+        try {
+            return Long.parseLong(v);
+        } catch (NumberFormatException e) {
+            throw new CommandError("value is not an integer or out of range");
+        }
+    }
+
+    private static long positive(String v) throws CommandError {
+        long n = integer(v);
+        if (n <= 0)
+            throw new CommandError("invalid expiration");
+        return n;
+    }
+
+    private static final class CommandError extends Exception {
+        CommandError(String m) {
+            super(m);
+        }
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\config\ServerConfig.java
+================================================================================
+package com.miniredis.config;
+
+import java.nio.file.Path;
+
+public record ServerConfig(int port, Path dataDirectory, boolean aofEnabled, int workerThreads, int maxKeys) {
+    public ServerConfig(int port, Path dataDirectory, boolean aofEnabled, int workerThreads) {
+        this(port, dataDirectory, aofEnabled, workerThreads, 0);
+    }
+
+    public static ServerConfig defaults() {
+        return new ServerConfig(
+                6379,
+                Path.of("data"),
+                true,
+                Math.max(2, Runtime.getRuntime().availableProcessors()),
+                0
+        );
+    }
+
+    public static ServerConfig fromArgs(String[] args) {
+        ServerConfig d = defaults();
+        int port = d.port;
+        Path data = d.dataDirectory;
+        boolean aof = d.aofEnabled;
+        int workers = d.workerThreads;
+        int maxKeys = d.maxKeys;
+
+        for (String arg : args) {
+            String[] p = arg.split("=", 2);
+            if (p.length != 2 || !p[0].startsWith("--")) {
+                throw new IllegalArgumentException("invalid option: " + arg);
+            }
+
+            switch (p[0]) {
+                case "--port" -> port = integer(p[1], "port");
+                case "--data-dir" -> data = Path.of(p[1]);
+                case "--aof" -> aof = Boolean.parseBoolean(p[1]);
+                case "--workers" -> workers = integer(p[1], "workers");
+                case "--max-keys" -> maxKeys = integer(p[1], "max-keys");
+                default -> throw new IllegalArgumentException("unknown option: " + p[0]);
+            }
+        }
+
+        if (port < 1 || port > 65535 || workers < 1 || maxKeys < 0) {
+            throw new IllegalArgumentException("port and workers must be positive; max-keys must not be negative");
+        }
+        return new ServerConfig(port, data, aof, workers, maxKeys);
+    }
+
+    private static int integer(String value, String name) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("invalid " + name);
+        }
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\metrics\Metrics.java
+================================================================================
+package com.miniredis.metrics;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Small lock-free counters shared by command workers. */
+public final class Metrics {
+    private final long startedAt = System.nanoTime();
+    private final AtomicLong commandsProcessed = new AtomicLong();
+    private final AtomicLong getCommands = new AtomicLong();
+    private final AtomicLong setCommands = new AtomicLong();
+    private final AtomicLong cacheHits = new AtomicLong();
+    private final AtomicLong cacheMisses = new AtomicLong();
+    private final AtomicLong evictions = new AtomicLong();
+    private final AtomicLong connectedClients = new AtomicLong();
+
+    public void command() { commandsProcessed.incrementAndGet(); }
+    public void get(boolean hit) {
+        getCommands.incrementAndGet();
+        (hit ? cacheHits : cacheMisses).incrementAndGet();
+    }
+    public void set() { setCommands.incrementAndGet(); }
+    public void eviction() { evictions.incrementAndGet(); }
+    public void clientConnected() { connectedClients.incrementAndGet(); }
+    public void clientDisconnected() { connectedClients.decrementAndGet(); }
+
+    public String info(int keys) {
+        return "commands_processed:" + commandsProcessed.get() + "\n"
+                + "get_commands:" + getCommands.get() + "\n"
+                + "set_commands:" + setCommands.get() + "\n"
+                + "cache_hits:" + cacheHits.get() + "\n"
+                + "cache_misses:" + cacheMisses.get() + "\n"
+                + "keys:" + keys + "\n"
+                + "evictions:" + evictions.get() + "\n"
+                + "uptime_seconds:" + ((System.nanoTime() - startedAt) / 1_000_000_000L) + "\n"
+                + "connected_clients:" + connectedClients.get();
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\persistence\AofPersistence.java
+================================================================================
+package com.miniredis.persistence;
+
+import com.miniredis.protocol.*;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+/**
+ * RESP-framed append-only command log. A partial trailing record is ignored
+ * during replay.
+ */
+public final class AofPersistence implements AutoCloseable {
+    @FunctionalInterface
+    public interface ReplayTarget {
+        void apply(List<String> command);
+    }
+
+    private final Path file;
+    private final Object lock = new Object();
+    private OutputStream output;
+
+    public AofPersistence(Path dataDirectory) throws IOException {
+        Files.createDirectories(dataDirectory);
+        file = dataDirectory.resolve("miniredis.aof");
+        output = new BufferedOutputStream(
+                Files.newOutputStream(file, StandardOpenOption.CREATE, StandardOpenOption.APPEND));
+    }
+
+    public void append(List<String> command) throws IOException {
+        synchronized (lock) {
+            List<RespValue> values = command.stream()
+                    .map(s -> new RespValue.Bulk(s.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                    .map(v -> (RespValue) v).toList();
+            RespEncoder.write(new RespValue.Array(values), output);
+            output.flush();
+        }
+    }
+
+    public void replay(ReplayTarget target) throws IOException {
+        if (!Files.exists(file))
+            return;
+        try (InputStream in = new BufferedInputStream(Files.newInputStream(file))) {
+            while (true) {
+                try {
+                    RespValue value = RespParser.read(in);
+                    if (value == null)
+                        return;
+                    List<String> command = command(value);
+                    if (command != null)
+                        target.apply(command);
+                } catch (EOFException | RespException ignoredTrailingRecord) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private static List<String> command(RespValue value) {
+        if (!(value instanceof RespValue.Array array) || array.isNull())
+            return null;
+        List<String> result = new ArrayList<>();
+        for (RespValue item : array.values()) {
+            if (!(item instanceof RespValue.Bulk bulk) || bulk.isNull())
+                return null;
+            result.add(new String(bulk.value(), java.nio.charset.StandardCharsets.UTF_8));
+        }
+        return result;
+    }
+
+    public Path file() {
+        return file;
+    }
+
+    public void close() throws IOException {
+        synchronized (lock) {
+            output.close();
+        }
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\protocol\RespEncoder.java
+================================================================================
+package com.miniredis.protocol;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+
+public final class RespEncoder {
+    private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.US_ASCII);
+
+    private RespEncoder() {
+    }
+
+    public static void write(RespValue value, OutputStream out) throws IOException {
+        if (value instanceof RespValue.Simple v)
+            line('+', v.value(), out);
+        else if (value instanceof RespValue.Error v)
+            line('-', v.message(), out);
+        else if (value instanceof RespValue.Number v)
+            line(':', Long.toString(v.value()), out);
+        else if (value instanceof RespValue.Bulk v) {
+            if (v.isNull()) {
+                out.write("$-1\r\n".getBytes(StandardCharsets.US_ASCII));
+            } else {
+                out.write(('$' + Integer.toString(v.value().length) + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                out.write(v.value());
+                out.write(CRLF);
+            }
+        } else if (value instanceof RespValue.Array v) {
+            if (v.isNull()) {
+                out.write("*-1\r\n".getBytes(StandardCharsets.US_ASCII));
+            } else {
+                out.write(('*' + Integer.toString(v.values().size()) + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                for (RespValue item : v.values())
+                    write(item, out);
+            }
+        }
+    }
+
+    public static byte[] encode(RespValue value) {
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            write(value, out);
+            return out.toByteArray();
+        } catch (IOException impossible) {
+            throw new UncheckedIOException(impossible);
+        }
+    }
+
+    private static void line(char prefix, String text, OutputStream out) throws IOException {
+        out.write((prefix + text + "\r\n").getBytes(StandardCharsets.UTF_8));
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\protocol\RespException.java
+================================================================================
+package com.miniredis.protocol;
+
+import java.io.IOException;
+
+public final class RespException extends IOException {
+    public RespException(String message) {
+        super(message);
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\protocol\RespParser.java
+================================================================================
+package com.miniredis.protocol;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+/**
+ * Streaming RESP2 parser. EOF before a new value returns null; EOF mid-value is
+ * an error.
+ */
+public final class RespParser {
+    private RespParser() {
+    }
+
+    public static RespValue read(InputStream input) throws IOException {
+        return read(input, true);
+    }
+
+    private static RespValue read(InputStream input, boolean topLevel) throws IOException {
+        int marker = input.read();
+        if (marker == -1) {
+            if (topLevel)
+                return null;
+            throw new EOFException("incomplete RESP value");
+        }
+        String line = line(input);
+        return switch (marker) {
+            case '+' -> new RespValue.Simple(line);
+            case '-' -> new RespValue.Error(line);
+            case ':' -> new RespValue.Number(number(line));
+            case '$' -> bulk(input, number(line));
+            case '*' -> array(input, number(line));
+            default -> throw new RespException("unknown RESP type: " + (char) marker);
+        };
+    }
+
+    private static RespValue.Bulk bulk(InputStream in, long length) throws IOException {
+        if (length == -1)
+            return new RespValue.Bulk(null);
+        if (length < -1 || length > Integer.MAX_VALUE)
+            throw new RespException("invalid bulk length");
+        byte[] data = in.readNBytes((int) length);
+        if (data.length != length)
+            throw new EOFException("incomplete bulk string");
+        requireCrlf(in);
+        return new RespValue.Bulk(data);
+    }
+
+    private static RespValue.Array array(InputStream in, long count) throws IOException {
+        if (count == -1)
+            return new RespValue.Array(null);
+        if (count < -1 || count > 1_000_000)
+            throw new RespException("invalid array length");
+        List<RespValue> values = new ArrayList<>();
+        for (int i = 0; i < count; i++)
+            values.add(read(in, false));
+        return new RespValue.Array(List.copyOf(values));
+    }
+
+    private static long number(String text) throws RespException {
+        try {
+            return Long.parseLong(text);
+        } catch (NumberFormatException e) {
+            throw new RespException("invalid integer");
+        }
+    }
+
+    private static String line(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int previous = -1;
+        while (true) {
+            int next = in.read();
+            if (next == -1)
+                throw new EOFException("incomplete RESP line");
+            if (previous == '\r' && next == '\n') {
+                byte[] raw = out.toByteArray();
+                return new String(raw, 0, raw.length - 1, StandardCharsets.UTF_8);
+            }
+            out.write(next);
+            previous = next;
+            if (out.size() > 16 * 1024 * 1024)
+                throw new RespException("RESP line too large");
+        }
+    }
+
+    private static void requireCrlf(InputStream in) throws IOException {
+        if (in.read() != '\r' || in.read() != '\n')
+            throw new RespException("bulk string missing CRLF");
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\protocol\RespValue.java
+================================================================================
+package com.miniredis.protocol;
+
+import java.util.List;
+
+/** Values in the small RESP2 subset used by MiniRedis. */
+public sealed interface RespValue permits RespValue.Simple, RespValue.Error, RespValue.Number, RespValue.Bulk, RespValue.Array 
+{
+    record Simple(String value) implements RespValue {
+    }
+
+    record Error(String message) implements RespValue {
+    }
+
+    record Number(long value) implements RespValue {
+    }
+
+    record Bulk(byte[] value) implements RespValue {
+        public boolean isNull() {
+            return value == null;
+        }
+    }
+
+    record Array(List<RespValue> values) implements RespValue {
+        public boolean isNull() {
+            return values == null;
+        }
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\server\MiniRedisServer.java
+================================================================================
+package com.miniredis.server;
+
+import com.miniredis.command.CommandDispatcher;
+import com.miniredis.config.ServerConfig;
+import com.miniredis.persistence.AofPersistence;
+import com.miniredis.protocol.*;
+import com.miniredis.metrics.Metrics;
+import com.miniredis.storage.*;
+import java.io.*;
+import java.net.*;
+import java.util.concurrent.*;
+
+public final class MiniRedisServer implements AutoCloseable {
+    private final ServerConfig config;
+    private final Metrics metrics = new Metrics();
+    private final KeyValueStore store;
+    private final ExecutorService workers;
+    private final ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor();
+    private volatile boolean running;
+    private ServerSocket socket;
+    private AofPersistence aof;
+    private CommandDispatcher dispatcher;
+    private Thread acceptor;
+
+    public MiniRedisServer(ServerConfig config) {
+        this.config = config;
+        store = new InMemoryKeyValueStore(config.maxKeys(), metrics::eviction);
+        workers = Executors.newFixedThreadPool(config.workerThreads());
+    }
+
+    public synchronized void start() throws IOException {
+        if (running)
+            return;
+        aof = config.aofEnabled() ? new AofPersistence(config.dataDirectory()) : null;
+        dispatcher = new CommandDispatcher(store, aof, metrics);
+        if (aof != null)
+            aof.replay(dispatcher::replay);
+        socket = new ServerSocket();
+        socket.bind(new InetSocketAddress(config.port()));
+        running = true;
+        maintenance.scheduleAtFixedRate(store::cleanupExpired, 1, 1, TimeUnit.SECONDS);
+        acceptor = new Thread(this::acceptLoop, "miniredis-acceptor");
+        acceptor.start();
+    }
+
+    private void acceptLoop() {
+        while (running)
+            try {
+                Socket client = socket.accept();
+                metrics.clientConnected();
+                workers.execute(() -> handle(client));
+            } catch (IOException e) {
+                if (running)
+                    System.err.println("accept failed: " + e.getMessage());
+            }
+    }
+
+    private void handle(Socket client) {
+        try (client;
+                InputStream in = new BufferedInputStream(client.getInputStream());
+                OutputStream out = new BufferedOutputStream(client.getOutputStream())) {
+            while (running && !client.isClosed()) {
+                RespValue request;
+                try {
+                    request = RespParser.read(in);
+                } catch (IOException e) {
+                    RespEncoder.write(new RespValue.Error("ERR malformed protocol: " + e.getMessage()), out);
+                    out.flush();
+                    return;
+                }
+                if (request == null)
+                    return;
+                RespEncoder.write(dispatcher.execute(request), out);
+                out.flush();
+            }
+        } catch (IOException ignored) {
+        } finally {
+            metrics.clientDisconnected();
+        }
+    }
+
+    public int port() {
+        return socket == null ? config.port() : socket.getLocalPort();
+    }
+
+    public synchronized void close() throws IOException {
+        running = false;
+        if (socket != null)
+            socket.close();
+        maintenance.shutdownNow();
+        workers.shutdownNow();
+        if (aof != null)
+            aof.close();
+    }
+
+    public static void main(String[] args) throws Exception {
+        ServerConfig config = ServerConfig.fromArgs(args);
+        MiniRedisServer server = new MiniRedisServer(config);
+        server.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                server.close();
+            } catch (IOException ignored) {
+            }
+        }));
+        System.out.println("MiniRedis listening on port " + server.port());
+        Thread.currentThread().join();
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\storage\InMemoryKeyValueStore.java
+================================================================================
+package com.miniredis.storage;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/** Concurrent map with lazy expiry; cleanupExpired is invoked periodically by the server. */
+public final class InMemoryKeyValueStore implements KeyValueStore {
+    private record Entry(String value, Long expiresAt) {
+        boolean expired(long now) {
+            return expiresAt != null && expiresAt <= now;
+        }
+    }
+
+    private final Map<String, Entry> values = new LinkedHashMap<>(16, 0.75f, true);
+    private final int maxKeys;
+    private final Runnable evictionListener;
+    private long evictions;
+
+    public InMemoryKeyValueStore() {
+        this(0);
+    }
+
+    public InMemoryKeyValueStore(int maxKeys) {
+        this(maxKeys, () -> { });
+    }
+
+    public InMemoryKeyValueStore(int maxKeys, Runnable evictionListener) {
+        if (maxKeys < 0)
+            throw new IllegalArgumentException("maxKeys must not be negative");
+        this.maxKeys = maxKeys;
+        this.evictionListener = evictionListener;
+    }
+
+    public synchronized void set(String key, String value, Long expirationMillis) {
+        values.put(key, new Entry(value, expirationMillis));
+        evictIfNeeded();
+    }
+
+    public synchronized Optional<String> get(String key) {
+        Entry entry = live(key);
+        return entry == null ? Optional.empty() : Optional.of(entry.value());
+    }
+
+    public synchronized boolean delete(String key) {
+        return values.remove(key) != null;
+    }
+
+    public synchronized boolean exists(String key) {
+        return live(key) != null;
+    }
+
+    public synchronized boolean expire(String key, long seconds) {
+        long at = seconds <= 0 ? System.currentTimeMillis()
+                : System.currentTimeMillis() + Math.multiplyExact(seconds, 1000);
+        Entry old = live(key);
+        if (old == null)
+            return false;
+        values.put(key, new Entry(old.value(), at));
+        return true;
+    }
+
+    public synchronized long ttl(String key) {
+        Entry entry = live(key);
+        if (entry == null) {
+            return -2;
+        }
+        if (entry.expiresAt() == null) {
+            return -1;
+        }
+        long left = entry.expiresAt() - System.currentTimeMillis();
+        return left <= 0 ? -2 : Math.max(1, (left + 999) / 1000);
+    }
+
+    public synchronized Set<String> keys() {
+        cleanupExpired();
+        return new TreeSet<>(values.keySet());
+    }
+
+    public synchronized void cleanupExpired() {
+        long now = System.currentTimeMillis();
+        values.entrySet().removeIf(e -> e.getValue().expired(now));
+    }
+
+    public synchronized long evictionCount() {
+        return evictions;
+    }
+
+    private Entry live(String key) {
+        Entry entry = values.get(key);
+        if (entry != null && entry.expired(System.currentTimeMillis())) {
+            values.remove(key);
+            return null;
+        }
+        return entry;
+    }
+
+    private void evictIfNeeded() {
+        while (maxKeys > 0 && values.size() > maxKeys) {
+            String eldest = values.keySet().iterator().next();
+            values.remove(eldest);
+            evictions++;
+            evictionListener.run();
+        }
+    }
+}
+
+================================================================================
+FILE: .\src\main\java\com\miniredis\storage\KeyValueStore.java
+================================================================================
+package com.miniredis.storage;
+import java.util.Optional;
+import java.util.Set;
+
+public interface KeyValueStore {
+    void set(String key, String value, Long expirationMillis);
+
+    Optional<String> get(String key);
+
+    boolean delete(String key);
+
+    boolean exists(String key);
+
+    boolean expire(String key, long seconds);
+
+    long ttl(String key);
+
+    Set<String> keys();
+
+    void cleanupExpired();
+}
+
+================================================================================
+FILE: .\src\test\java\com\miniredis\command\CommandDispatcherTest.java
+================================================================================
+package com.miniredis.command;
+
+import com.miniredis.protocol.*;
+import com.miniredis.storage.*;
+import com.miniredis.metrics.Metrics;
+import static org.junit.jupiter.api.Assertions.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import org.junit.jupiter.api.Test;
+
+class CommandDispatcherTest {
+    private final CommandDispatcher commands = new CommandDispatcher(new InMemoryKeyValueStore(), null);
+
+    @Test
+    void executesCommandsAndReportsErrors() {
+        assertEquals(new RespValue.Simple("PONG"), run("PING"));
+        assertEquals(new RespValue.Simple("OK"), run("SET", "name", "Ada"));
+        assertEquals("Ada", text(run("GET", "name")));
+        assertEquals(new RespValue.Number(1), run("EXISTS", "name"));
+        assertEquals(new RespValue.Number(1), run("DEL", "name"));
+        assertTrue(run("GET", "name") instanceof RespValue.Bulk b && b.isNull());
+        assertTrue(run("NOPE") instanceof RespValue.Error);
+        assertTrue(run("SET", "x") instanceof RespValue.Error);
+        assertTrue(run("EXPIRE", "x", "no") instanceof RespValue.Error);
+    }
+
+    @Test
+    void supportsSetExAndKeys() {
+        run("SET", "temporary", "x", "EX", "2");
+        assertTrue(((RespValue.Number) run("TTL", "temporary")).value() > 0);
+        RespValue.Array keys = (RespValue.Array) run("KEYS", "*");
+        assertEquals(1, keys.values().size());
+    }
+
+    @Test
+    void reportsMetricsAndEvictions() {
+        Metrics metrics = new Metrics();
+        InMemoryKeyValueStore store = new InMemoryKeyValueStore(1, metrics::eviction);
+        CommandDispatcher dispatcher = new CommandDispatcher(store, null, metrics);
+        run(dispatcher, "SET", "a", "1");
+        run(dispatcher, "GET", "a");
+        run(dispatcher, "GET", "missing");
+        run(dispatcher, "SET", "b", "2");
+        String info = text(run(dispatcher, "INFO"));
+        assertTrue(info.contains("commands_processed:5"));
+        assertTrue(info.contains("get_commands:2"));
+        assertTrue(info.contains("set_commands:2"));
+        assertTrue(info.contains("cache_hits:1"));
+        assertTrue(info.contains("cache_misses:1"));
+        assertTrue(info.contains("keys:1"));
+        assertTrue(info.contains("evictions:1"));
+    }
+
+    private RespValue run(String... args) {
+        return run(commands, args);
+    }
+
+    private RespValue run(CommandDispatcher dispatcher, String... args) {
+        return dispatcher.execute(new RespValue.Array(Arrays.stream(args)
+                .map(s -> new RespValue.Bulk(s.getBytes(StandardCharsets.UTF_8))).map(x -> (RespValue) x).toList()));
+    }
+
+    private String text(RespValue r) {
+        return new String(((RespValue.Bulk) r).value(), StandardCharsets.UTF_8);
+    }
+}
+
+================================================================================
+FILE: .\src\test\java\com\miniredis\config\ServerConfigTest.java
+================================================================================
+package com.miniredis.config;
+
+import static org.junit.jupiter.api.Assertions.*;
+import org.junit.jupiter.api.Test;
+
+class ServerConfigTest {
+    @Test
+    void parsesMaxKeysAndKeepsZeroUnlimited() {
+        ServerConfig config = ServerConfig.fromArgs(new String[] { "--max-keys=25", "--workers=2" });
+        assertEquals(25, config.maxKeys());
+        assertEquals(2, config.workerThreads());
+        assertEquals(0, ServerConfig.defaults().maxKeys());
+    }
+
+    @Test
+    void rejectsNegativeMaxKeys() {
+        assertThrows(IllegalArgumentException.class,
+                () -> ServerConfig.fromArgs(new String[] { "--max-keys=-1" }));
+    }
+}
+
+================================================================================
+FILE: .\src\test\java\com\miniredis\persistence\AofPersistenceTest.java
+================================================================================
+package com.miniredis.persistence;
+
+import com.miniredis.command.*;
+import com.miniredis.protocol.*;
+import com.miniredis.storage.*;
+import static org.junit.jupiter.api.Assertions.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.io.TempDir;
+
+class AofPersistenceTest {
+    @TempDir
+    Path dir;
+
+    @Test
+    void replaysCommandsAndIgnoresPartialTail() throws Exception {
+        try (AofPersistence aof = new AofPersistence(dir)) {
+            aof.append(List.of("SET", "name", "Ada"));
+            aof.append(List.of("DEL", "gone"));
+        }
+        Files.write(dir.resolve("miniredis.aof"), "*2\r\n$3\r\nSET\r\n$4\r\npart".getBytes(StandardCharsets.UTF_8),
+                StandardOpenOption.APPEND);
+        InMemoryKeyValueStore store = new InMemoryKeyValueStore();
+        try (AofPersistence aof = new AofPersistence(dir)) {
+            aof.replay(new CommandDispatcher(store, null)::replay);
+        }
+        assertEquals("Ada", store.get("name").orElseThrow());
+    }
+}
+
+================================================================================
+FILE: .\src\test\java\com\miniredis\protocol\RespProtocolTest.java
+================================================================================
+package com.miniredis.protocol;
+
+import static org.junit.jupiter.api.Assertions.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import org.junit.jupiter.api.Test;
+
+class RespProtocolTest {
+    @Test
+    void parsesEverySupportedValue() throws Exception {
+        assertEquals(new RespValue.Simple("OK"), read("+OK\r\n"));
+        assertEquals(new RespValue.Error("bad"), read("-bad\r\n"));
+        assertEquals(new RespValue.Number(42), read(":42\r\n"));
+        assertEquals("hello", new String(((RespValue.Bulk) read("$5\r\nhello\r\n")).value(), StandardCharsets.UTF_8));
+        assertTrue(((RespValue.Bulk) read("$-1\r\n")).isNull());
+        assertTrue(((RespValue.Array) read("*-1\r\n")).isNull());
+    }
+
+    @Test
+    void parsesArraysAndRoundTrips() throws Exception {
+        RespValue value = read("*2\r\n$4\r\nPING\r\n$2\r\nhi\r\n");
+        assertEquals("PING", new String(((RespValue.Bulk) ((RespValue.Array) value).values().get(0)).value()));
+        assertArrayEquals(RespEncoder.encode(value),
+                RespEncoder.encode(RespParser.read(new ByteArrayInputStream(RespEncoder.encode(value)))));
+    }
+
+    @Test
+    void rejectsMalformedAndIncompleteInput() {
+        assertThrows(RespException.class, () -> read("?x\r\n"));
+        assertThrows(EOFException.class, () -> read("$5\r\nabc"));
+        assertThrows(RespException.class, () -> read(":x\r\n"));
+    }
+
+    private RespValue read(String value) throws Exception {
+        return RespParser.read(new ByteArrayInputStream(value.getBytes(StandardCharsets.UTF_8)));
+    }
+}
+
+================================================================================
+FILE: .\src\test\java\com\miniredis\server\MiniRedisServerIntegrationTest.java
+================================================================================
+package com.miniredis.server;
+
+import com.miniredis.config.*;
+import com.miniredis.protocol.*;
+import static org.junit.jupiter.api.Assertions.*;
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.io.TempDir;
+
+class MiniRedisServerIntegrationTest {
+    @TempDir
+    Path dir;
+
+    @Test
+    void servesCommandsOverTcpAndRestoresAof() throws Exception {
+        ServerConfig c = new ServerConfig(0, dir, true, 4);
+        try (MiniRedisServer server = new MiniRedisServer(c)) {
+            server.start();
+            try (Socket s = new Socket("localhost", server.port())) {
+                assertEquals("PONG", simple(send(s, "PING")));
+                assertEquals("OK", simple(send(s, "SET", "name", "Ada")));
+                assertEquals("Ada", bulk(send(s, "GET", "name")));
+                assertEquals(1, number(send(s, "EXISTS", "name")));
+                assertEquals("OK", simple(send(s, "SET", "temp", "x", "EX", "1")));
+                assertTrue(number(send(s, "TTL", "temp")) > 0);
+                assertEquals(2, ((RespValue.Array) send(s, "KEYS", "*")).values().size());
+                Thread.sleep(1100);
+                assertTrue(((RespValue.Bulk) send(s, "GET", "temp")).isNull());
+            }
+        }
+        try (MiniRedisServer restarted = new MiniRedisServer(c)) {
+            restarted.start();
+            try (Socket s = new Socket("localhost", restarted.port())) {
+                assertEquals("Ada", bulk(send(s, "GET", "name")));
+                assertEquals(1, number(send(s, "DEL", "name")));
+                assertTrue(((RespValue.Bulk) send(s, "GET", "name")).isNull());
+            }
+        }
+    }
+
+    private RespValue send(Socket s, String... args) throws Exception {
+        List<RespValue> a = Arrays.stream(args).map(x -> new RespValue.Bulk(x.getBytes(StandardCharsets.UTF_8)))
+                .map(x -> (RespValue) x).toList();
+        RespEncoder.write(new RespValue.Array(a), s.getOutputStream());
+        s.getOutputStream().flush();
+        return RespParser.read(s.getInputStream());
+    }
+
+    private String simple(RespValue v) {
+        return ((RespValue.Simple) v).value();
+    }
+
+    private String bulk(RespValue v) {
+        return new String(((RespValue.Bulk) v).value(), StandardCharsets.UTF_8);
+    }
+
+    private long number(RespValue v) {
+        return ((RespValue.Number) v).value();
+    }
+}
+
+================================================================================
+FILE: .\src\test\java\com\miniredis\storage\InMemoryKeyValueStoreTest.java
+================================================================================
+package com.miniredis.storage;
+
+import static org.junit.jupiter.api.Assertions.*;
+import java.util.concurrent.*;
+import org.junit.jupiter.api.Test;
+
+class InMemoryKeyValueStoreTest {
+    @Test
+    void supportsCrudTtlAndKeys() throws Exception {
+        KeyValueStore s = new InMemoryKeyValueStore();
+        s.set("a", "one", null);
+        assertEquals("one", s.get("a").orElseThrow());
+        s.set("a", "two", null);
+        assertTrue(s.exists("a"));
+        assertEquals(-1, s.ttl("a"));
+        assertTrue(s.expire("a", 1));
+        assertTrue(s.ttl("a") > 0);
+        assertTrue(s.keys().contains("a"));
+        Thread.sleep(1100);
+        assertFalse(s.exists("a"));
+        assertEquals(-2, s.ttl("a"));
+        assertFalse(s.delete("a"));
+    }
+
+    @Test
+    void handlesConcurrentWrites() throws Exception {
+        KeyValueStore s = new InMemoryKeyValueStore();
+        ExecutorService e = Executors.newFixedThreadPool(8);
+        for (int i = 0; i < 200; i++) {
+            int n = i;
+            e.submit(() -> s.set("k" + n, "v" + n, null));
+        }
+        e.shutdown();
+        assertTrue(e.awaitTermination(5, TimeUnit.SECONDS));
+        assertEquals(200, s.keys().size());
+    }
+
+    @Test
+    void evictsLeastRecentlyUsedKey() {
+        KeyValueStore s = new InMemoryKeyValueStore(3);
+        s.set("A", "1", null);
+        s.set("B", "2", null);
+        s.set("C", "3", null);
+        s.get("A");
+        s.set("D", "4", null);
+        assertTrue(s.exists("A"));
+        assertFalse(s.exists("B"));
+        assertTrue(s.exists("C"));
+        assertTrue(s.exists("D"));
+    }
+
+    @Test
+    void concurrentWritesRespectLimit() throws Exception {
+        KeyValueStore s = new InMemoryKeyValueStore(10);
+        ExecutorService e = Executors.newFixedThreadPool(8);
+        for (int i = 0; i < 200; i++) {
+            int n = i;
+            e.submit(() -> s.set("k" + n, "v", null));
+        }
+        e.shutdown();
+        assertTrue(e.awaitTermination(5, TimeUnit.SECONDS));
+        assertEquals(10, s.keys().size());
+    }
+
+    @Test
+    void zeroMeansUnlimited() {
+        KeyValueStore s = new InMemoryKeyValueStore(0);
+        for (int i = 0; i < 20; i++)
+            s.set("k" + i, "v", null);
+        assertEquals(20, s.keys().size());
+    }
+}
