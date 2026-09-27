@@ -3,6 +3,7 @@ package com.miniredis.command;
 import com.miniredis.persistence.AofPersistence;
 import com.miniredis.protocol.*;
 import com.miniredis.storage.KeyValueStore;
+import com.miniredis.metrics.Metrics;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -14,10 +15,16 @@ import java.util.*;
 public final class CommandDispatcher {
     private final KeyValueStore store;
     private final AofPersistence aof;
+    private final Metrics metrics;
 
     public CommandDispatcher(KeyValueStore store, AofPersistence aof) {
+        this(store, aof, new Metrics());
+    }
+
+    public CommandDispatcher(KeyValueStore store, AofPersistence aof, Metrics metrics) {
         this.store = store;
         this.aof = aof;
+        this.metrics = metrics;
     }
 
     public RespValue execute(RespValue request) {
@@ -41,6 +48,8 @@ public final class CommandDispatcher {
         if (args.isEmpty())
             throw new CommandError("empty command");
         String op = args.get(0).toUpperCase(Locale.ROOT);
+        if (persist)
+            metrics.command();
         RespValue result;
         boolean mutation = false;
         switch (op) {
@@ -50,8 +59,9 @@ public final class CommandDispatcher {
             }
             case "GET" -> {
                 require(args, 2);
-                result = store.get(args.get(1)).<RespValue>map(CommandDispatcher::bulk)
-                        .orElse(new RespValue.Bulk(null));
+                Optional<String> value = store.get(args.get(1));
+                metrics.get(value.isPresent());
+                result = value.<RespValue>map(CommandDispatcher::bulk).orElse(new RespValue.Bulk(null));
             }
             case "SET" -> {
                 if (args.size() != 3 && args.size() != 5)
@@ -64,6 +74,8 @@ public final class CommandDispatcher {
                     expiry = System.currentTimeMillis() + Math.multiplyExact(seconds, 1000);
                 }
                 store.set(args.get(1), args.get(2), expiry);
+                if (persist)
+                    metrics.set();
                 result = new RespValue.Simple("OK");
                 mutation = true;
             }
@@ -102,6 +114,10 @@ public final class CommandDispatcher {
                     throw new CommandError("only KEYS * is supported");
                 result = new RespValue.Array(
                         store.keys().stream().map(CommandDispatcher::bulk).map(x -> (RespValue) x).toList());
+            }
+            case "INFO" -> {
+                require(args, 1);
+                result = bulk(metrics.info(store.keys().size()));
             }
             default -> throw new CommandError("unknown command '" + args.get(0) + "'");
         }

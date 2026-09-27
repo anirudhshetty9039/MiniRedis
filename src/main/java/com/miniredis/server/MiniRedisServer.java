@@ -4,6 +4,7 @@ import com.miniredis.command.CommandDispatcher;
 import com.miniredis.config.ServerConfig;
 import com.miniredis.persistence.AofPersistence;
 import com.miniredis.protocol.*;
+import com.miniredis.metrics.Metrics;
 import com.miniredis.storage.*;
 import java.io.*;
 import java.net.*;
@@ -11,7 +12,8 @@ import java.util.concurrent.*;
 
 public final class MiniRedisServer implements AutoCloseable {
     private final ServerConfig config;
-    private final KeyValueStore store = new InMemoryKeyValueStore();
+    private final Metrics metrics = new Metrics();
+    private final KeyValueStore store;
     private final ExecutorService workers;
     private final ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor();
     private volatile boolean running;
@@ -22,6 +24,7 @@ public final class MiniRedisServer implements AutoCloseable {
 
     public MiniRedisServer(ServerConfig config) {
         this.config = config;
+        store = new InMemoryKeyValueStore(config.maxKeys(), metrics::eviction);
         workers = Executors.newFixedThreadPool(config.workerThreads());
     }
 
@@ -29,7 +32,7 @@ public final class MiniRedisServer implements AutoCloseable {
         if (running)
             return;
         aof = config.aofEnabled() ? new AofPersistence(config.dataDirectory()) : null;
-        dispatcher = new CommandDispatcher(store, aof);
+        dispatcher = new CommandDispatcher(store, aof, metrics);
         if (aof != null)
             aof.replay(dispatcher::replay);
         socket = new ServerSocket();
@@ -44,6 +47,7 @@ public final class MiniRedisServer implements AutoCloseable {
         while (running)
             try {
                 Socket client = socket.accept();
+                metrics.clientConnected();
                 workers.execute(() -> handle(client));
             } catch (IOException e) {
                 if (running)
@@ -70,6 +74,8 @@ public final class MiniRedisServer implements AutoCloseable {
                 out.flush();
             }
         } catch (IOException ignored) {
+        } finally {
+            metrics.clientDisconnected();
         }
     }
 
